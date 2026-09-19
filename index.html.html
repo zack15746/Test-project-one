@@ -1,0 +1,2034 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Sword Trial</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: #12161f;
+    --accent: #6ee7ff;
+    --text: #e8edf5;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #f4f6fb;
+      --panel: #ffffff;
+      --accent: #0ea5c9;
+      --text: #12161f;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0b0e14;
+    --panel: #12161f;
+    --accent: #6ee7ff;
+    --text: #e8edf5;
+  }
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    overflow: hidden;
+  }
+  #overlay {
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 18px; padding: 24px; text-align: center; z-index: 10;
+  }
+  #overlay h1 { font-size: clamp(1.4rem, 5vw, 2.2rem); margin: 0; }
+  #overlay p { max-width: 480px; line-height: 1.5; opacity: 0.85; margin: 0; }
+  #enterBtn {
+    background: var(--accent); color: #05161a; border: none;
+    padding: 16px 32px; font-size: 1.1rem; font-weight: 600;
+    border-radius: 999px; cursor: pointer;
+  }
+  #enterBtn:disabled { opacity: 0.5; }
+  #status {
+    font-size: 0.85rem; opacity: 0.6; max-width: 420px;
+  }
+  #hud {
+    position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,0.5); color: white;
+    padding: 8px 18px; border-radius: 999px; font-size: 0.95rem;
+    display: none; z-index: 5;
+  }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+
+<div id="overlay">
+  <h1>&#9876;&#65039; Sword Trial</h1>
+  <p>A VR sword-fighting scene. Open this page on your Quest's browser, tap Enter VR, grab the sword, and head into the dungeon. The skeleton will chase and attack once it spots you - watch your health bar at the bottom of your view.</p>
+  <button id="enterBtn">Checking VR support&hellip;</button>
+  <p id="status"></p>
+</div>
+
+<div id="hud">Skeleton Health: <span id="hpText">100</span>%</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function() {
+  let renderer, scene, camera, worldGroup;
+  let controller1, controller2;
+  let playerTorso, leftArm, rightArm;
+  let mirrorPlane, mirrorTorso, mirrorLeftArm, mirrorRightArm, mirrorLeftHand, mirrorRightHand;
+  let inventoryPanel, inventoryTexture, inventoryCanvas, inventoryCtx;
+  let inventoryUpdateTimer = 0;
+  const weapons = []; // each: {group, tip, prevPos, velocity, heldBy, lastHitTime, minSpeed, maxDamage, grabRadius, hitRadius}
+  let dummy, dummyHead, dummyBody, dummyHealthBarFill;
+  let dummyHealth = 100;
+  let dummyDead = false;
+  let snapTurnCooldown = false;
+  let drawHand = null;
+  const MAX_DRAW = 0.4;
+  const dungeonWalls = [];
+  const collisionWalls = []; // {minX,maxX,minZ,maxZ} AABBs, dungeon-local space
+  const collisionProps = []; // {x,z,radius} circles, dungeon-local space
+  const raycaster = new THREE.Raycaster();
+
+  let skeletonState = 'idle'; // idle | chase | attack
+  let skeletonAttackTimer = 0;
+  let playerHealth = 100;
+  let playerDead = false;
+  let playerHealthBarFill, damageFlashMesh;
+  let xpBarFill, levelCanvas, levelCtx, levelTexture;
+  let playerXP = 0, playerLevel = 1, xpToNextLevel = 100;
+
+  const DETECTION_RANGE = 9;
+  const ATTACK_RANGE = 1.1;
+  const CHASE_SPEED = 1.6;
+  const ATTACK_INTERVAL = 1.5;
+  const ATTACK_DAMAGE = 12;
+
+  const JUMP_SPEED = 4.0;
+  const GRAVITY = 9.8;
+  let playerVerticalVelocity = 0;
+  let playerJumpOffset = 0;
+  let jumpButtonWasPressed = false;
+
+  const clock = new THREE.Clock();
+
+  const statusEl = document.getElementById('status');
+  const enterBtn = document.getElementById('enterBtn');
+  const overlay = document.getElementById('overlay');
+  const hud = document.getElementById('hud');
+  const hpText = document.getElementById('hpText');
+
+  init();
+
+  // Generates a small tileable stone-block texture on an offscreen
+  // canvas - no external image files needed (keeps things fast and
+  // avoids any network dependency), and it's cheap enough for Quest 2
+  // since it's just one small texture reused across every wall/floor.
+  function createStoneTexture(repeatX, repeatY, baseShade) {
+    const size = 256;
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+
+    ctx.fillStyle = `rgb(${baseShade - 10},${baseShade - 12},${baseShade - 8})`;
+    ctx.fillRect(0, 0, size, size);
+
+    const block = 32;
+    for (let y = 0; y < size; y += block) {
+      const rowOffset = (Math.floor(y / block) % 2) * (block / 2);
+      for (let x = -block; x < size + block; x += block) {
+        const bx = x + rowOffset;
+        const shade = baseShade + Math.floor(Math.random() * 26) - 13;
+        ctx.fillStyle = `rgb(${shade},${shade - 2},${shade + 2})`;
+        ctx.fillRect(bx + 2, y + 2, block - 4, block - 4);
+      }
+    }
+
+    ctx.strokeStyle = 'rgba(10,10,12,0.55)';
+    ctx.lineWidth = 2;
+    for (let y = 0; y <= size; y += block) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(size, y); ctx.stroke();
+    }
+    for (let x = 0; x <= size; x += block) {
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, size); ctx.stroke();
+    }
+
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(repeatX, repeatY);
+    return tex;
+  }
+
+  function init() {
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1a1f2b);
+    scene.fog = new THREE.Fog(0x1a1f2b, 8, 20);
+
+    camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 50);
+
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.xr.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    // Lighting
+    scene.add(new THREE.AmbientLight(0xffffff, 0.32));
+    scene.add(new THREE.HemisphereLight(0x554466, 0x3a2515, 0.55));
+    const dirLight = new THREE.DirectionalLight(0xffddaa, 0.3);
+    dirLight.position.set(2, 5, 3);
+    scene.add(dirLight);
+
+    // Everything the player walks around (floor, dummy, sword, etc.)
+    // lives in worldGroup. To let the player move using the thumbstick
+    // in a small physical room, we move/rotate this group instead of
+    // the player - the player (camera/controllers) always stays at
+    // their real physical position.
+    worldGroup = new THREE.Group();
+    scene.add(worldGroup);
+
+    // Dungeon mood lighting/fog - darker and moodier than the open grid
+    scene.background = new THREE.Color(0x0e0d10);
+    scene.fog = new THREE.Fog(0x0e0d10, 4, 30);
+
+    // Floor + ceiling sized to cover the whole dungeon layout
+    // (entrance at z=3 down through the boss room at z=-38, and out
+    // to the side rooms at x=+-16)
+    const floorTex = createStoneTexture(16, 20, 66);
+    const ceilingTex = createStoneTexture(16, 20, 46);
+    const floorMat = new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.95, side: THREE.DoubleSide });
+    const ceilingMat = new THREE.MeshStandardMaterial({ map: ceilingTex, roughness: 0.98, side: THREE.DoubleSide });
+
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(36, 44), floorMat);
+    floor.rotation.x = -Math.PI / 2;
+    floor.position.set(0, 0, -17.5);
+    worldGroup.add(floor);
+
+    const ceiling = new THREE.Mesh(new THREE.PlaneGeometry(36, 44), ceilingMat);
+    ceiling.rotation.x = Math.PI / 2;
+    ceiling.position.set(0, 3, -17.5);
+    worldGroup.add(ceiling);
+
+    buildDungeon();
+    buildDecorations();
+    buildTrapTile();
+    buildGasTrapRoom();
+    buildDummy();
+    buildSword();
+    buildDagger(0.62, -0.35);
+    buildDagger(-0.02, -0.35);
+    buildBow();
+    buildPlayerHUD();
+    buildMirror();
+
+    // Bright ring right at the spawn point so something is always
+    // visible immediately, even before finding the sword/dummy.
+    const spawnRing = new THREE.Mesh(
+      new THREE.RingGeometry(0.6, 0.7, 32),
+      new THREE.MeshBasicMaterial({ color: 0x6ee7ff, side: THREE.DoubleSide })
+    );
+    spawnRing.rotation.x = -Math.PI / 2;
+    spawnRing.position.y = 0.01;
+    worldGroup.add(spawnRing);
+
+    // Controllers
+    controller1 = renderer.xr.getController(0);
+    controller2 = renderer.xr.getController(1);
+    scene.add(controller1);
+    scene.add(controller2);
+
+    controller1.addEventListener('selectstart', () => onGrabStart(controller1));
+    controller1.addEventListener('selectend', () => onGrabEnd(controller1));
+    controller2.addEventListener('selectstart', () => onGrabStart(controller2));
+    controller2.addEventListener('selectend', () => onGrabEnd(controller2));
+
+    // Hands - parented to the controllers so they naturally track
+    // hand position/rotation. Replaces the old placeholder cone.
+    [controller1, controller2].forEach(c => {
+      const hand = buildHand();
+      c.add(hand);
+    });
+
+    buildPlayerBody();
+    buildInventoryPanel();
+
+    // Start any holsterable weapons (daggers) sheathed on the belt
+    // rather than sitting loose on the pedestal.
+    weapons.forEach(w => {
+      if (w.holsterOffset) {
+        playerTorso.add(w.group);
+        w.group.position.copy(w.holsterOffset);
+        w.group.rotation.set(w.holsterRotation.x, w.holsterRotation.y, w.holsterRotation.z);
+      }
+    });
+
+    window.addEventListener('resize', onResize);
+
+    checkSupport();
+    enterBtn.addEventListener('click', enterVR);
+
+    renderer.setAnimationLoop(render);
+  }
+
+  function buildHand() {
+    const skinMat = new THREE.MeshStandardMaterial({ color: 0xcf9e76, roughness: 0.85 });
+    const group = new THREE.Group();
+
+    const palm = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.035, 0.09), skinMat);
+    palm.position.set(0, 0, -0.03);
+    group.add(palm);
+
+    const thumb = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.05, 5), skinMat);
+    thumb.position.set(0.045, 0.01, -0.01);
+    thumb.rotation.z = Math.PI / 3;
+    group.add(thumb);
+
+    const knuckles = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.03, 0.03), skinMat);
+    knuckles.position.set(0, 0, -0.075);
+    group.add(knuckles);
+
+    return group;
+  }
+
+  function buildPlayerBody() {
+    const bodyMat = new THREE.MeshStandardMaterial({ color: 0x3a3a42, roughness: 0.85 });
+    const skinMat = new THREE.MeshStandardMaterial({ color: 0xcf9e76, roughness: 0.85 });
+
+    // Torso follows the head's horizontal position/facing each frame
+    // (see updatePlayerBody) but is added directly to the scene, not
+    // worldGroup - it represents the player's real physical body, the
+    // same way the controllers and camera are handled.
+    playerTorso = new THREE.Group();
+    scene.add(playerTorso);
+
+    const chest = new THREE.Mesh(new THREE.CylinderGeometry(0.19, 0.23, 0.42, 8), bodyMat);
+    playerTorso.add(chest);
+
+    const shoulders = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.2, 0.1, 8), bodyMat);
+    shoulders.position.y = 0.22;
+    playerTorso.add(shoulders);
+
+    // Stretchy forearms - cylinders with unit height, rescaled and
+    // reoriented every frame to span from shoulder to hand. Added
+    // directly to the scene (real-world space, same as the hands).
+    leftArm = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.045, 1, 6), skinMat);
+    rightArm = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.045, 1, 6), skinMat);
+    scene.add(leftArm);
+    scene.add(rightArm);
+  }
+
+  function updateArmSegment(mesh, fromPos, toPos) {
+    const mid = fromPos.clone().add(toPos).multiplyScalar(0.5);
+    const dist = fromPos.distanceTo(toPos);
+    mesh.position.copy(mid);
+    mesh.scale.y = Math.max(0.001, dist);
+    const dir = toPos.clone().sub(fromPos).normalize();
+    if (dir.lengthSq() > 0.0001) {
+      mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+    }
+  }
+
+  function buildMirror() {
+    // A small mirror on the Entrance room's south wall (the solid
+    // wall opposite the doorway - z=3, facing into the room).
+    const frameMat = new THREE.MeshStandardMaterial({ color: 0x4a3524, roughness: 0.8 });
+    const glassMat = new THREE.MeshStandardMaterial({
+      color: 0x8fa8b8, metalness: 0.6, roughness: 0.15,
+      emissive: 0x1a2530, emissiveIntensity: 0.3
+    });
+
+    const frameGroup = new THREE.Group();
+    frameGroup.position.set(0, 1.1, 2.83);
+    frameGroup.rotation.y = Math.PI; // faces -Z, into the room
+    worldGroup.add(frameGroup);
+
+    mirrorPlane = new THREE.Mesh(new THREE.PlaneGeometry(0.7, 1.3), glassMat);
+    frameGroup.add(mirrorPlane);
+
+    const frameThickness = 0.06;
+    const border = [
+      { w: 0.82, h: frameThickness, x: 0, y: 0.68 },   // top
+      { w: 0.82, h: frameThickness, x: 0, y: -0.68 },  // bottom
+      { w: frameThickness, h: 1.42, x: -0.38, y: 0 },  // left
+      { w: frameThickness, h: 1.42, x: 0.38, y: 0 }    // right
+    ];
+    border.forEach(b => {
+      const piece = new THREE.Mesh(new THREE.BoxGeometry(b.w, b.h, 0.04), frameMat);
+      piece.position.set(b.x, b.y, -0.01);
+      frameGroup.add(piece);
+    });
+
+    buildMirrorAvatar();
+  }
+
+  function buildMirrorAvatar() {
+    const bodyMat = new THREE.MeshStandardMaterial({ color: 0x3a3a42, roughness: 0.85 });
+    const skinMat = new THREE.MeshStandardMaterial({ color: 0xcf9e76, roughness: 0.85 });
+
+    mirrorTorso = new THREE.Group();
+    scene.add(mirrorTorso);
+    const chest = new THREE.Mesh(new THREE.CylinderGeometry(0.19, 0.23, 0.42, 8), bodyMat);
+    mirrorTorso.add(chest);
+    const shoulders = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.2, 0.1, 8), bodyMat);
+    shoulders.position.y = 0.22;
+    mirrorTorso.add(shoulders);
+
+    mirrorLeftArm = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.045, 1, 6), skinMat);
+    mirrorRightArm = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.045, 1, 6), skinMat);
+    scene.add(mirrorLeftArm);
+    scene.add(mirrorRightArm);
+
+    mirrorLeftHand = buildHand();
+    mirrorRightHand = buildHand();
+    scene.add(mirrorLeftHand);
+    scene.add(mirrorRightHand);
+  }
+
+  // Reflects a world-space point across the mirror's current plane
+  // (derived live from its actual world transform, so this stays
+  // correct even if the dungeon shifts/rotates under the player from
+  // locomotion or snap-turns).
+  function reflectPointAcrossMirror(p) {
+    const q = mirrorPlane.getWorldPosition(new THREE.Vector3());
+    const n = new THREE.Vector3(0, 0, 1).applyQuaternion(mirrorPlane.getWorldQuaternion(new THREE.Quaternion())).normalize();
+    const d = p.clone().sub(q).dot(n);
+    return p.clone().sub(n.multiplyScalar(2 * d));
+  }
+
+  function reflectDirAcrossMirror(dir) {
+    const n = new THREE.Vector3(0, 0, 1).applyQuaternion(mirrorPlane.getWorldQuaternion(new THREE.Quaternion())).normalize();
+    const d = dir.dot(n);
+    return dir.clone().sub(n.multiplyScalar(2 * d));
+  }
+
+  function updateMirrorAvatar() {
+    if (!renderer.xr.isPresenting || !playerTorso || !mirrorPlane) return;
+
+    // Mirror the torso
+    const torsoWorldPos = playerTorso.getWorldPosition(new THREE.Vector3());
+    mirrorTorso.position.copy(reflectPointAcrossMirror(torsoWorldPos));
+
+    const torsoForward = new THREE.Vector3(0, 0, 1).applyQuaternion(playerTorso.getWorldQuaternion(new THREE.Quaternion()));
+    const reflectedForward = reflectDirAcrossMirror(torsoForward);
+    mirrorTorso.rotation.set(0, Math.atan2(reflectedForward.x, reflectedForward.z), 0);
+    mirrorTorso.updateMatrixWorld(true);
+
+    // Mirror the arms (shoulder -> hand, same stretchy-cylinder trick)
+    const leftShoulder = new THREE.Vector3(-0.22, 0.24, 0).applyMatrix4(mirrorTorso.matrixWorld);
+    const rightShoulder = new THREE.Vector3(0.22, 0.24, 0).applyMatrix4(mirrorTorso.matrixWorld);
+    const leftHandWorld = reflectPointAcrossMirror(controller1.getWorldPosition(new THREE.Vector3()));
+    const rightHandWorld = reflectPointAcrossMirror(controller2.getWorldPosition(new THREE.Vector3()));
+
+    updateArmSegment(mirrorLeftArm, leftShoulder, leftHandWorld);
+    updateArmSegment(mirrorRightArm, rightShoulder, rightHandWorld);
+
+    // Mirror the hands - position exactly, orientation approximated
+    // via the controller's own forward direction reflected the same way
+    mirrorLeftHand.position.copy(leftHandWorld);
+    mirrorRightHand.position.copy(rightHandWorld);
+    [[controller1, mirrorLeftHand], [controller2, mirrorRightHand]].forEach(([ctrl, handMesh]) => {
+      const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(ctrl.getWorldQuaternion(new THREE.Quaternion()));
+      const reflectedFwd = reflectDirAcrossMirror(fwd);
+      handMesh.rotation.set(0, Math.atan2(reflectedFwd.x, reflectedFwd.z), 0);
+    });
+  }
+
+  function updatePlayerBody() {
+    if (!renderer.xr.isPresenting || !playerTorso) return;
+
+    const xrCamera = renderer.xr.getCamera(camera);
+    const headPos = xrCamera.getWorldPosition(new THREE.Vector3());
+    const headForward = new THREE.Vector3();
+    xrCamera.getWorldDirection(headForward);
+    const yaw = Math.atan2(headForward.x, headForward.z);
+
+    playerTorso.position.set(headPos.x, headPos.y - 0.5, headPos.z);
+    playerTorso.rotation.set(0, yaw, 0);
+    playerTorso.updateMatrixWorld(true);
+
+    const leftShoulder = new THREE.Vector3(-0.22, 0.24, 0).applyMatrix4(playerTorso.matrixWorld);
+    const rightShoulder = new THREE.Vector3(0.22, 0.24, 0).applyMatrix4(playerTorso.matrixWorld);
+
+    updateArmSegment(leftArm, leftShoulder, controller1.getWorldPosition(new THREE.Vector3()));
+    updateArmSegment(rightArm, rightShoulder, controller2.getWorldPosition(new THREE.Vector3()));
+  }
+
+  function buildPlayerHUD() {
+    // A translucent red sphere around the camera used for damage
+    // feedback - flashes briefly on hit, stays tinted while dead.
+    const flashMat = new THREE.MeshBasicMaterial({
+      color: 0xff0000, transparent: true, opacity: 0,
+      side: THREE.BackSide, depthTest: false, depthWrite: false
+    });
+    damageFlashMesh = new THREE.Mesh(new THREE.SphereGeometry(0.3, 12, 12), flashMat);
+    camera.add(damageFlashMesh);
+
+    // Health + XP bars, stacked neatly in the bottom-right of the view
+    const barGroup = new THREE.Group();
+    barGroup.position.set(0.24, -0.16, -0.5);
+    camera.add(barGroup);
+
+    const barWidth = 0.2;
+
+    // Level readout, drawn via canvas just above the two bars
+    levelCanvas = document.createElement('canvas');
+    levelCanvas.width = 128;
+    levelCanvas.height = 40;
+    levelCtx = levelCanvas.getContext('2d');
+    levelTexture = new THREE.CanvasTexture(levelCanvas);
+    const levelPanel = new THREE.Mesh(
+      new THREE.PlaneGeometry(barWidth, 0.03),
+      new THREE.MeshBasicMaterial({ map: levelTexture, transparent: true, depthTest: false })
+    );
+    levelPanel.position.set(0, 0.045, 0);
+    barGroup.add(levelPanel);
+
+    // Health bar
+    const hpBg = new THREE.Mesh(
+      new THREE.PlaneGeometry(barWidth + 0.01, 0.03),
+      new THREE.MeshBasicMaterial({ color: 0x222222, transparent: true, opacity: 0.85, depthTest: false })
+    );
+    barGroup.add(hpBg);
+    playerHealthBarFill = new THREE.Mesh(
+      new THREE.PlaneGeometry(barWidth, 0.022),
+      new THREE.MeshBasicMaterial({ color: 0x4ade80, depthTest: false })
+    );
+    playerHealthBarFill.position.z = 0.001;
+    barGroup.add(playerHealthBarFill);
+
+    // XP bar, directly beneath the health bar
+    const xpBg = new THREE.Mesh(
+      new THREE.PlaneGeometry(barWidth + 0.01, 0.02),
+      new THREE.MeshBasicMaterial({ color: 0x222222, transparent: true, opacity: 0.85, depthTest: false })
+    );
+    xpBg.position.set(0, -0.03, 0);
+    barGroup.add(xpBg);
+    xpBarFill = new THREE.Mesh(
+      new THREE.PlaneGeometry(barWidth, 0.014),
+      new THREE.MeshBasicMaterial({ color: 0xb78cf5, depthTest: false })
+    );
+    xpBarFill.position.set(0, -0.03, 0.001);
+    barGroup.add(xpBarFill);
+
+    updateLevelDisplay();
+    updateXPUI();
+  }
+
+  function buildDungeon() {
+    const wallTex = createStoneTexture(3, 1, 58);
+    const wallMat = new THREE.MeshStandardMaterial({ map: wallTex, roughness: 0.95 });
+    const wallHeight = 3;
+
+    function wall(cx, cz, width, depth) {
+      const w = new THREE.Mesh(new THREE.BoxGeometry(width, wallHeight, depth), wallMat);
+      w.position.set(cx, wallHeight / 2, cz);
+      worldGroup.add(w);
+      dungeonWalls.push(w);
+      collisionWalls.push({ minX: cx - width / 2, maxX: cx + width / 2, minZ: cz - depth / 2, maxZ: cz + depth / 2 });
+    }
+
+    // Simple static torch prop (no dynamic light) - kept cheap for
+    // Quest 2, since real-time point lights are costly on mobile GPUs.
+    function torch(x, y, z) {
+      const bracket = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.03, 0.03, 0.25, 6),
+        new THREE.MeshStandardMaterial({ color: 0x2a2a2a })
+      );
+      bracket.rotation.z = Math.PI / 2;
+      bracket.position.set(x, y, z);
+      worldGroup.add(bracket);
+
+      const flame = new THREE.Mesh(
+        new THREE.SphereGeometry(0.06, 8, 8),
+        new THREE.MeshBasicMaterial({ color: 0xffaa44 })
+      );
+      flame.position.set(x, y + 0.12, z);
+      worldGroup.add(flame);
+    }
+
+    // ================= ENTRANCE (spawn room) =================
+    // x:[-3,3]  z:[-3,3] - opening on north wall (z=-3) into Corridor 1
+    wall(-2, -3, 2, 0.3);
+    wall(2, -3, 2, 0.3);
+    wall(0, 3, 6, 0.3);
+    wall(3, 0, 0.3, 6);
+    wall(-3, 0, 0.3, 6);
+    torch(-2.9, 1.6, 1);
+    torch(2.9, 1.6, -1);
+
+    // ========== CORRIDOR 1: Entrance -> Main Hall ==========
+    // x:[-1,1]  z:[-3,-8]
+    wall(-1, -5.5, 0.3, 5);
+    wall(1, -5.5, 0.3, 5);
+    torch(-0.9, 1.6, -5.5);
+
+    // ================= MAIN HALL =================
+    // x:[-7,7]  z:[-8,-20] - openings: north (corridor 1), south
+    // (corridor 2 to boss room), and two gaps on each side wall
+    // leading to the four side rooms.
+    wall(-4, -8, 6, 0.3);    // north wall, west segment (leaves x:-1..1 gap)
+    wall(4, -8, 6, 0.3);     // north wall, east segment
+    wall(-4, -20, 6, 0.3);   // south wall, west segment
+    wall(4, -20, 6, 0.3);    // south wall, east segment
+
+    // west wall: solid except two 2m gaps (z:-11..-9 and z:-17..-15)
+    wall(-7, -8.5, 0.3, 1);
+    wall(-7, -13, 0.3, 4);
+    wall(-7, -18.5, 0.3, 3);
+
+    // east wall: mirrored
+    wall(7, -8.5, 0.3, 1);
+    wall(7, -13, 0.3, 4);
+    wall(7, -18.5, 0.3, 3);
+
+    torch(-1.5, 1.6, -8.9);
+    torch(1.5, 1.6, -8.9);
+    torch(-1.5, 1.6, -19.9);
+    torch(1.5, 1.6, -19.9);
+
+    // ===== 4 side corridors connecting Main Hall to side rooms =====
+    wall(-8.5, -9, 3, 0.3);  wall(-8.5, -11, 3, 0.3);   // west corridor A (z -11..-9)
+    wall(-8.5, -15, 3, 0.3); wall(-8.5, -17, 3, 0.3);   // west corridor B (z -17..-15)
+    wall(8.5, -9, 3, 0.3);   wall(8.5, -11, 3, 0.3);    // east corridor A
+    wall(8.5, -15, 3, 0.3);  wall(8.5, -17, 3, 0.3);    // east corridor B
+
+    // ===== Side Room West-A: x:[-16,-10] z:[-13,-7] =====
+    wall(-13, -7, 6, 0.3);
+    wall(-13, -13, 6, 0.3);
+    wall(-16, -10, 0.3, 6);
+    wall(-10, -8, 0.3, 2);
+    wall(-10, -12, 0.3, 2);
+    torch(-15.9, 1.6, -8);
+    torch(-15.9, 1.6, -12);
+
+    // ===== Side Room West-B: x:[-16,-10] z:[-19,-13] =====
+    // (shares its north wall with Side Room West-A's south wall above)
+    wall(-13, -19, 6, 0.3);
+    wall(-16, -16, 0.3, 6);
+    wall(-10, -14, 0.3, 2);
+    wall(-10, -18, 0.3, 2);
+    torch(-15.9, 1.6, -14);
+    torch(-15.9, 1.6, -18);
+
+    // ===== Side Room East-A: x:[10,16] z:[-13,-7] =====
+    wall(13, -7, 6, 0.3);
+    wall(13, -13, 6, 0.3);
+    wall(16, -10, 0.3, 6);
+    wall(10, -8, 0.3, 2);
+    wall(10, -12, 0.3, 2);
+    torch(15.9, 1.6, -8);
+    torch(15.9, 1.6, -12);
+
+    // ===== Side Room East-B: x:[10,16] z:[-19,-13] =====
+    // (shares its north wall with Side Room East-A's south wall above)
+    wall(13, -19, 6, 0.3);
+    wall(16, -16, 0.3, 6);
+    wall(10, -14, 0.3, 2);
+    wall(10, -18, 0.3, 2);
+    torch(15.9, 1.6, -14);
+    torch(15.9, 1.6, -18);
+
+    // ========== CORRIDOR 2: Main Hall -> Boss Room ==========
+    // x:[-1,1]  z:[-20,-25]
+    wall(-1, -22.5, 0.3, 5);
+    wall(1, -22.5, 0.3, 5);
+    torch(-0.9, 1.6, -22.5);
+
+    // ================= BOSS ROOM =================
+    // x:[-9,9]  z:[-25,-38] - single entrance on the north wall,
+    // otherwise sealed. Left empty for now - no enemy placed yet.
+    wall(-5, -25, 8, 0.3);
+    wall(5, -25, 8, 0.3);
+    wall(0, -38, 18, 0.3);
+    wall(9, -31.5, 0.3, 13);
+    wall(-9, -31.5, 0.3, 13);
+    torch(-8.9, 1.6, -28);
+    torch(8.9, 1.6, -28);
+    torch(-8.9, 1.6, -35);
+    torch(8.9, 1.6, -35);
+  }
+
+  // Pure set-dressing pass over the existing layout - no walls, gaps,
+  // or gameplay logic are touched here, only decorative props.
+  function buildDecorations() {
+    const stoneMat = new THREE.MeshStandardMaterial({ color: 0x5c5c64, roughness: 0.9 });
+    const darkStoneMat = new THREE.MeshStandardMaterial({ color: 0x38383e, roughness: 0.95 });
+    const woodMat = new THREE.MeshStandardMaterial({ color: 0x4a3524, roughness: 0.9 });
+    const metalMat = new THREE.MeshStandardMaterial({ color: 0x2a2a2e, metalness: 0.6, roughness: 0.5 });
+    const boneDecorMat = new THREE.MeshStandardMaterial({ color: 0xd9d0b8, roughness: 0.85 });
+
+    // ---------------- Pillars ----------------
+    function pillar(x, z) {
+      const base = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.4, 0.2, 8), stoneMat);
+      base.position.set(x, 0.1, z);
+      worldGroup.add(base);
+
+      const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.28, 2.6, 8), stoneMat);
+      shaft.position.set(x, 1.5, z);
+      worldGroup.add(shaft);
+
+      const capital = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.3, 0.2, 8), stoneMat);
+      capital.position.set(x, 2.9, z);
+      worldGroup.add(capital);
+
+      collisionProps.push({ x, z, radius: 0.38 });
+    }
+    pillar(-4, -11); pillar(4, -11); pillar(-4, -17); pillar(4, -17); // Main Hall
+    pillar(-6, -29); pillar(6, -29); pillar(-6, -34); pillar(6, -34); // Boss Room
+
+    // ---------------- Arches over the main path doorways ----------------
+    function archOver(cx, cz) {
+      const a = new THREE.Mesh(new THREE.TorusGeometry(1.1, 0.12, 6, 16, Math.PI), darkStoneMat);
+      a.position.set(cx, 2.0, cz);
+      worldGroup.add(a);
+    }
+    archOver(0, -3);  // Entrance -> Corridor 1
+    archOver(0, -8);  // Corridor 1 -> Main Hall
+    archOver(0, -20); // Main Hall -> Corridor 2
+    archOver(0, -25); // Corridor 2 -> Boss Room
+
+    // ---------------- Banners ----------------
+    function banner(x, z, rotY) {
+      const cloth = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.8, 1.7),
+        new THREE.MeshStandardMaterial({ color: 0x7a1f1f, roughness: 0.9, side: THREE.DoubleSide })
+      );
+      cloth.position.set(x, 1.9, z);
+      cloth.rotation.y = rotY;
+      worldGroup.add(cloth);
+
+      const stripe = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.8, 0.15),
+        new THREE.MeshStandardMaterial({ color: 0xb89a4a, roughness: 0.8, side: THREE.DoubleSide })
+      );
+      stripe.position.set(x, 1.9, z + 0.001);
+      stripe.rotation.y = rotY;
+      worldGroup.add(stripe);
+    }
+    banner(-4, -8.05, 0);   banner(4, -8.05, 0);    // Main Hall, near north wall
+    banner(-4, -19.95, 0);  banner(4, -19.95, 0);   // Main Hall, near south wall
+    banner(-8.75, -28, Math.PI / 2);                // Boss Room
+    banner(8.75, -28, Math.PI / 2);                 // Boss Room
+
+    // ---------------- Crates & barrels ----------------
+    function crate(x, z, rotY) {
+      const c = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.5, 0.5), woodMat);
+      c.position.set(x, 0.25, z);
+      c.rotation.y = rotY || 0;
+      worldGroup.add(c);
+      collisionProps.push({ x, z, radius: 0.32 });
+    }
+    function barrel(x, z) {
+      const b = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.3, 0.6, 10), woodMat);
+      b.position.set(x, 0.3, z);
+      worldGroup.add(b);
+      const band = new THREE.Mesh(new THREE.TorusGeometry(0.29, 0.02, 4, 10), metalMat);
+      band.rotation.x = Math.PI / 2;
+      band.position.set(x, 0.3, z);
+      worldGroup.add(band);
+      collisionProps.push({ x, z, radius: 0.32 });
+    }
+    crate(-14, -8, 0.3);   crate(-14.6, -8.4, -0.2); barrel(-12, -11.5);   // Side Room West-A
+    barrel(-14, -14);      crate(-12, -17, 0.5);                          // Side Room West-B
+    crate(14, -8, -0.3);   barrel(12, -11.5);                             // Side Room East-A
+    crate(14, -17, 0.4);   barrel(12, -14);                               // Side Room East-B
+    crate(-6, -9.5, 0.2);  barrel(6, -19);                                // Main Hall corners
+
+    // ---------------- Hanging chains ----------------
+    function hangingChain(x, z) {
+      for (let i = 0; i < 3; i++) {
+        const link = new THREE.Mesh(new THREE.TorusGeometry(0.08, 0.02, 4, 8), metalMat);
+        link.rotation.x = Math.PI / 2;
+        link.rotation.y = (i % 2) * (Math.PI / 2);
+        link.position.set(x, 2.8 - i * 0.28, z);
+        worldGroup.add(link);
+      }
+    }
+    hangingChain(-3, -27); hangingChain(3, -27); // Boss Room, flanking entrance
+    hangingChain(-3, -14); hangingChain(3, -14); // Main Hall
+
+    // ---------------- Bones scattered on the floor ----------------
+    function boneScatter(x, z) {
+      for (let i = 0; i < 3; i++) {
+        const b = new THREE.Mesh(new THREE.CylinderGeometry(0.02, 0.02, 0.3 + Math.random() * 0.2, 5), boneDecorMat);
+        b.position.set(x + (Math.random() - 0.5) * 0.4, 0.03, z + (Math.random() - 0.5) * 0.4);
+        b.rotation.set(Math.PI / 2, Math.random() * Math.PI, 0);
+        worldGroup.add(b);
+      }
+    }
+    boneScatter(-1, -26); boneScatter(1.5, -27); // Boss Room approach
+    boneScatter(-6, -19); boneScatter(-14, -17); // Main Hall / side room
+
+    // ---------------- Rubble piles ----------------
+    function rubblePile(x, z) {
+      for (let i = 0; i < 3; i++) {
+        const rock = new THREE.Mesh(new THREE.IcosahedronGeometry(0.08 + Math.random() * 0.06, 0), darkStoneMat);
+        rock.position.set(x + (Math.random() - 0.5) * 0.5, 0.06, z + (Math.random() - 0.5) * 0.5);
+        rock.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, 0);
+        worldGroup.add(rock);
+      }
+    }
+    rubblePile(6, -9.5); rubblePile(-7, -36);
+    rubblePile(-15, -12); rubblePile(15, -17);
+
+    // ---------------- Statues flanking key doorways ----------------
+    function statue(x, z) {
+      const pedestal = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.35, 0.5), stoneMat);
+      pedestal.position.set(x, 0.175, z);
+      worldGroup.add(pedestal);
+
+      const body = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.22, 1.3, 8), stoneMat);
+      body.position.set(x, 1.0, z);
+      worldGroup.add(body);
+
+      const head = new THREE.Mesh(new THREE.SphereGeometry(0.15, 8, 8), stoneMat);
+      head.position.set(x, 1.75, z);
+      worldGroup.add(head);
+
+      collisionProps.push({ x, z, radius: 0.3 });
+    }
+    statue(-2.5, -26); statue(2.5, -26);   // Boss Room entrance guardians
+    statue(-2.5, -19.5); statue(2.5, -19.5); // Main Hall, toward Corridor 2
+
+    // ---------------- Atmospheric lighting ----------------
+    // Just two static accent lights in the Boss Room for a dramatic
+    // focal point - kept few and non-flickering to stay cheap on
+    // Quest 2 (everywhere else relies on the unlit torch props above).
+    const bossLight1 = new THREE.PointLight(0xff8844, 0.8, 10, 2);
+    bossLight1.position.set(-3, 2.4, -31.5);
+    worldGroup.add(bossLight1);
+
+    const bossLight2 = new THREE.PointLight(0xff8844, 0.8, 10, 2);
+    bossLight2.position.set(3, 2.4, -31.5);
+    worldGroup.add(bossLight2);
+  }
+
+  // Trap tile in Side Room West-A: step on it and the walls fire a
+  // volley of poison darts at you.
+  const TRAP_X = -13, TRAP_Z = -11;
+  const TRAP_RADIUS = 0.35;
+  const TRAP_COOLDOWN = 4; // seconds before it can trigger again
+  let trapCooldownTimer = 0;
+  let trapTile = null;
+  const activeDarts = []; // {mesh, velocity, life}
+  let poisonTimer = 0;
+  let poisonTickAccum = 0;
+
+  function buildTrapTile() {
+    const plateMat = new THREE.MeshStandardMaterial({ color: 0x4a6a4a, roughness: 0.85, metalness: 0.15 });
+    const plate = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.32, 0.02, 10), plateMat);
+    plate.position.set(TRAP_X, 0.015, TRAP_Z);
+    worldGroup.add(plate);
+
+    // A subtle warning ring so it's not a completely invisible trap
+    const ringMat = new THREE.MeshBasicMaterial({ color: 0x88ff88 });
+    const ring = new THREE.Mesh(new THREE.RingGeometry(0.28, 0.32, 16), ringMat);
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.set(TRAP_X, 0.021, TRAP_Z);
+    worldGroup.add(ring);
+
+    trapTile = { x: TRAP_X, z: TRAP_Z };
+  }
+
+  function updateTrapTile(delta) {
+    if (trapCooldownTimer > 0) {
+      trapCooldownTimer -= delta;
+      return;
+    }
+    if (!renderer.xr.isPresenting || !trapTile) return;
+
+    const headWorldPos = renderer.xr.getCamera(camera).getWorldPosition(new THREE.Vector3());
+    const localPos = worldGroup.worldToLocal(headWorldPos.clone());
+    const dx = localPos.x - trapTile.x;
+    const dz = localPos.z - trapTile.z;
+
+    if (dx * dx + dz * dz < TRAP_RADIUS * TRAP_RADIUS) {
+      triggerTrap(headWorldPos);
+      trapCooldownTimer = TRAP_COOLDOWN;
+    }
+  }
+
+  function triggerTrap(playerWorldPos) {
+    // Dart ports along the walls of Side Room West-A, aimed at the
+    // player's position at the moment the trap fires.
+    const spawnPointsLocal = [
+      new THREE.Vector3(-13, 1.2, -7.1),
+      new THREE.Vector3(-13, 1.2, -12.9),
+      new THREE.Vector3(-16.1, 1.2, -10),
+      new THREE.Vector3(-10.1, 1.2, -8),
+      new THREE.Vector3(-10.1, 1.2, -12)
+    ];
+    spawnPointsLocal.forEach(localPt => {
+      const worldPt = worldGroup.localToWorld(localPt.clone());
+      const dir = playerWorldPos.clone().sub(worldPt).normalize();
+      spawnDart(worldPt, dir);
+    });
+  }
+
+  function spawnDart(originWorld, dirWorld) {
+    const dartMat = new THREE.MeshStandardMaterial({ color: 0x2f6b2f, roughness: 0.6 });
+    const tipMat = new THREE.MeshBasicMaterial({ color: 0x77ff77 });
+    const group = new THREE.Group();
+
+    const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.008, 0.18, 5), dartMat);
+    shaft.position.y = 0.09;
+    group.add(shaft);
+
+    const tip = new THREE.Mesh(new THREE.ConeGeometry(0.012, 0.05, 5), tipMat);
+    tip.position.y = 0.2;
+    group.add(tip);
+
+    if (dirWorld.lengthSq() > 0.0001) {
+      group.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dirWorld);
+    }
+    group.position.copy(originWorld);
+    scene.add(group);
+
+    activeDarts.push({ mesh: group, velocity: dirWorld.clone().multiplyScalar(9), life: 0 });
+  }
+
+  function updateDarts(delta) {
+    if (activeDarts.length === 0) return;
+    const headWorldPos = renderer.xr.getCamera(camera).getWorldPosition(new THREE.Vector3());
+
+    for (let i = activeDarts.length - 1; i >= 0; i--) {
+      const d = activeDarts[i];
+      d.life += delta;
+      d.mesh.position.addScaledVector(d.velocity, delta);
+
+      if (d.mesh.position.distanceTo(headWorldPos) < 0.35) {
+        damagePlayer(8, 0x66ff66);
+        poisonTimer = 4; // seconds of poison ticking
+        scene.remove(d.mesh);
+        activeDarts.splice(i, 1);
+        continue;
+      }
+
+      if (d.life > 3) { // missed - despawn after a few seconds
+        scene.remove(d.mesh);
+        activeDarts.splice(i, 1);
+      }
+    }
+  }
+
+  function updatePoison(delta) {
+    if (poisonTimer <= 0) return;
+    poisonTimer -= delta;
+    poisonTickAccum += delta;
+    if (poisonTickAccum >= 1) {
+      poisonTickAccum = 0;
+      damagePlayer(3, 0x66ff66);
+    }
+  }
+
+  // Gas trap room, using Side Room East-A. Walking in seals the
+  // doorway behind you for a fixed duration while the room fills
+  // with poison gas, then the door reopens on its own.
+  const GAS_ROOM_BOUNDS = { minX: 10.2, maxX: 15.8, minZ: -12.8, maxZ: -7.2 };
+  const GAS_DOOR_X = 10, GAS_DOOR_ZMIN = -11, GAS_DOOR_ZMAX = -9;
+  const GAS_DOOR_CLOSED_Y = 1.55;
+  const GAS_DOOR_OPEN_Y = 4.8;
+  const GAS_DURATION = 8;
+  const GAS_COOLDOWN = 4;
+
+  let gasRoomState = 'idle'; // idle -> active -> cooldown -> idle
+  let gasRoomTimer = 0;
+  let wasInsideGasRoom = false;
+  let gasDoorCollisionBox = null;
+  let gasVolumeMesh, gasDoorMesh;
+  let gasDamageAccum = 0;
+  let gasDoorTargetY = GAS_DOOR_OPEN_Y;
+  let gasOpacityTarget = 0;
+
+  function buildGasTrapRoom() {
+    const doorMat = new THREE.MeshStandardMaterial({ color: 0x3a3a42, metalness: 0.5, roughness: 0.6 });
+    gasDoorMesh = new THREE.Mesh(new THREE.BoxGeometry(0.25, 3.1, 2), doorMat);
+    gasDoorMesh.position.set(GAS_DOOR_X, GAS_DOOR_OPEN_Y, (GAS_DOOR_ZMIN + GAS_DOOR_ZMAX) / 2);
+    worldGroup.add(gasDoorMesh);
+
+    const gasMat = new THREE.MeshBasicMaterial({
+      color: 0x66dd66, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false
+    });
+    const width = GAS_ROOM_BOUNDS.maxX - GAS_ROOM_BOUNDS.minX;
+    const depth = GAS_ROOM_BOUNDS.maxZ - GAS_ROOM_BOUNDS.minZ;
+    gasVolumeMesh = new THREE.Mesh(new THREE.BoxGeometry(width, 2.8, depth), gasMat);
+    gasVolumeMesh.position.set(
+      (GAS_ROOM_BOUNDS.minX + GAS_ROOM_BOUNDS.maxX) / 2, 1.4,
+      (GAS_ROOM_BOUNDS.minZ + GAS_ROOM_BOUNDS.maxZ) / 2
+    );
+    worldGroup.add(gasVolumeMesh);
+  }
+
+  function updateGasRoom(delta) {
+    // Door slide and gas fade animate continuously toward their targets
+    gasDoorMesh.position.y += (gasDoorTargetY - gasDoorMesh.position.y) * Math.min(1, delta * 3);
+    gasVolumeMesh.material.opacity += (gasOpacityTarget - gasVolumeMesh.material.opacity) * Math.min(1, delta * 2);
+
+    if (!renderer.xr.isPresenting) return;
+
+    const headWorldPos = renderer.xr.getCamera(camera).getWorldPosition(new THREE.Vector3());
+    const localPos = worldGroup.worldToLocal(headWorldPos.clone());
+    const insideNow = localPos.x > GAS_ROOM_BOUNDS.minX && localPos.x < GAS_ROOM_BOUNDS.maxX &&
+      localPos.z > GAS_ROOM_BOUNDS.minZ && localPos.z < GAS_ROOM_BOUNDS.maxZ;
+
+    if (gasRoomState === 'idle' && insideNow && !wasInsideGasRoom) {
+      startGasTrap();
+    }
+    wasInsideGasRoom = insideNow;
+
+    if (gasRoomState === 'active') {
+      gasRoomTimer -= delta;
+      if (insideNow) {
+        gasDamageAccum += delta;
+        if (gasDamageAccum >= 1) {
+          gasDamageAccum = 0;
+          damagePlayer(6, 0x66dd66);
+        }
+      }
+      if (gasRoomTimer <= 0) endGasTrap();
+    } else if (gasRoomState === 'cooldown') {
+      gasRoomTimer -= delta;
+      if (gasRoomTimer <= 0) gasRoomState = 'idle';
+    }
+  }
+
+  function startGasTrap() {
+    gasRoomState = 'active';
+    gasRoomTimer = GAS_DURATION;
+    gasDamageAccum = 0;
+    gasDoorTargetY = GAS_DOOR_CLOSED_Y;
+    gasOpacityTarget = 0.35;
+
+    gasDoorCollisionBox = { minX: GAS_DOOR_X - 0.15, maxX: GAS_DOOR_X + 0.15, minZ: GAS_DOOR_ZMIN, maxZ: GAS_DOOR_ZMAX };
+    collisionWalls.push(gasDoorCollisionBox);
+  }
+
+  function endGasTrap() {
+    gasRoomState = 'cooldown';
+    gasRoomTimer = GAS_COOLDOWN;
+    gasDoorTargetY = GAS_DOOR_OPEN_Y;
+    gasOpacityTarget = 0;
+
+    if (gasDoorCollisionBox) {
+      const idx = collisionWalls.indexOf(gasDoorCollisionBox);
+      if (idx !== -1) collisionWalls.splice(idx, 1);
+      gasDoorCollisionBox = null;
+    }
+  }
+
+  function buildDummy() {
+    dummy = new THREE.Group();
+    dummy.position.set(0, 0, -31.5); // center of the boss room
+    worldGroup.add(dummy);
+
+    const boneMat = new THREE.MeshStandardMaterial({ color: 0xe6ddc4, roughness: 0.85 });
+    const darkMat = new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.9 });
+
+    // Torso (ribcage) - same hitbox size/position as before, just reskinned
+    dummyBody = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.24, 1.1, 10), boneMat);
+    dummyBody.position.y = 1.05;
+    dummy.add(dummyBody);
+
+    // Rib rings wrapped around the torso for a skeletal read
+    for (let i = 0; i < 4; i++) {
+      const rib = new THREE.Mesh(new THREE.TorusGeometry(0.22, 0.02, 6, 12), boneMat);
+      rib.rotation.x = Math.PI / 2;
+      rib.position.y = 0.7 + i * 0.22;
+      dummy.add(rib);
+    }
+
+    // Skull - same hitbox size/position as before, just reskinned
+    dummyHead = new THREE.Mesh(new THREE.SphereGeometry(0.16, 12, 12), boneMat);
+    dummyHead.position.y = 1.75;
+    dummy.add(dummyHead);
+
+    // Eye sockets (dark) with glowing red pupils
+    [-0.06, 0.06].forEach(offsetX => {
+      const socket = new THREE.Mesh(new THREE.SphereGeometry(0.035, 8, 8), darkMat);
+      socket.position.set(offsetX, 1.77, 0.14);
+      dummy.add(socket);
+
+      const glow = new THREE.Mesh(
+        new THREE.SphereGeometry(0.018, 8, 8),
+        new THREE.MeshBasicMaterial({ color: 0xff2222 })
+      );
+      glow.position.set(offsetX, 1.77, 0.16);
+      dummy.add(glow);
+    });
+
+    // Arm bones, hanging loosely at the sides
+    [-0.28, 0.28].forEach(offsetX => {
+      const arm = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.03, 0.7, 6), boneMat);
+      arm.position.set(offsetX, 1.15, 0);
+      arm.rotation.z = offsetX > 0 ? -0.25 : 0.25;
+      dummy.add(arm);
+    });
+
+    // Leg bones, replacing the old wooden post
+    [-0.08, 0.08].forEach(offsetX => {
+      const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.04, 0.9, 6), boneMat);
+      leg.position.set(offsetX, 0.45, 0);
+      dummy.add(leg);
+    });
+
+    // Health bar (floating above head)
+    const barBg = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.5, 0.06),
+      new THREE.MeshBasicMaterial({ color: 0x222222 })
+    );
+    barBg.position.set(0, 2.05, 0);
+    dummy.add(barBg);
+
+    dummyHealthBarFill = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.48, 0.045),
+      new THREE.MeshBasicMaterial({ color: 0x4ade80 })
+    );
+    dummyHealthBarFill.position.set(0, 2.05, 0.001);
+    dummy.add(dummyHealthBarFill);
+
+    // give the dummy hittable userData reference
+    [dummyBody, dummyHead].forEach(m => { m.userData.isDummy = true; });
+  }
+
+  function registerWeapon(group, tip, opts) {
+    const w = {
+      group, tip,
+      prevPos: tip.getWorldPosition(new THREE.Vector3()),
+      velocity: new THREE.Vector3(),
+      heldBy: null,
+      lastHitTime: 0,
+      minSpeed: opts.minSpeed,
+      maxDamage: opts.maxDamage,
+      grabRadius: opts.grabRadius,
+      hitRadius: opts.hitRadius,
+      throwable: !!opts.throwable,
+      thrown: false,
+      throwVelocity: new THREE.Vector3(),
+      holsterOffset: opts.holsterOffset || null, // local position on playerTorso, if it belongs on a holster
+      holsterRotation: opts.holsterRotation || new THREE.Vector3(0, 0, 0), // local rest rotation on that holster
+      throwPowerMultiplier: opts.throwPowerMultiplier || 1.3,
+      spinRate: opts.spinRate || 12,
+      orientToVelocity: !!opts.orientToVelocity, // true for arrows - fly straight instead of tumbling
+      isBow: !!opts.isBow
+    };
+    weapons.push(w);
+    return w;
+  }
+
+  function buildSword() {
+    const group = new THREE.Group();
+
+    // Blade - bright polished steel, tapered to a point via a traced
+    // shape instead of a plain box, with a subtle central fuller line
+    const steelMat = new THREE.MeshStandardMaterial({ color: 0xe4e8ee, metalness: 0.85, roughness: 0.18 });
+    const bladeShape = new THREE.Shape();
+    bladeShape.moveTo(-0.022, 0);
+    bladeShape.lineTo(0.022, 0);
+    bladeShape.lineTo(0.022, 0.48);
+    bladeShape.lineTo(0, 0.62); // tapered point
+    bladeShape.lineTo(-0.022, 0.48);
+    bladeShape.lineTo(-0.022, 0);
+    const bladeGeo = new THREE.ExtrudeGeometry(bladeShape, { depth: 0.008, bevelEnabled: false });
+    bladeGeo.translate(0, 0, -0.004); // center the thin extrusion
+    const blade = new THREE.Mesh(bladeGeo, steelMat);
+    group.add(blade);
+
+    const fullerMat = new THREE.MeshStandardMaterial({ color: 0xaab2bd, metalness: 0.7, roughness: 0.3 });
+    const fuller = new THREE.Mesh(new THREE.BoxGeometry(0.006, 0.46, 0.009), fullerMat);
+    fuller.position.y = 0.24;
+    group.add(fuller);
+
+    // Winged crossguard, flaring outward and slightly forward like the reference
+    const guardMat = new THREE.MeshStandardMaterial({ color: 0xcdd3db, metalness: 0.8, roughness: 0.3 });
+    [-1, 1].forEach(side => {
+      const wing = new THREE.Mesh(new THREE.ConeGeometry(0.02, 0.13, 4), guardMat);
+      wing.position.set(side * 0.09, 0.015, 0.01);
+      wing.rotation.z = side * (Math.PI / 2 - 0.35);
+      wing.rotation.y = Math.PI / 4;
+      group.add(wing);
+    });
+    const guardCenter = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.03, 0.03), guardMat);
+    guardCenter.position.y = 0.01;
+    group.add(guardCenter);
+
+    // Blue diamond gem set into the guard, just like the reference
+    const gemMat = new THREE.MeshStandardMaterial({
+      color: 0x3a7fd9, emissive: 0x2255aa, emissiveIntensity: 0.7,
+      metalness: 0.3, roughness: 0.15
+    });
+    const gem = new THREE.Mesh(new THREE.OctahedronGeometry(0.024), gemMat);
+    gem.position.set(0, 0.01, 0.02);
+    group.add(gem);
+
+    const gemLight = new THREE.PointLight(0x4488ff, 0.4, 1.0, 2);
+    gemLight.position.copy(gem.position);
+    group.add(gemLight);
+
+    // Blue-wrapped grip
+    const handleMat = new THREE.MeshStandardMaterial({ color: 0x1a2f52, roughness: 0.85 });
+    const handle = new THREE.Mesh(new THREE.CylinderGeometry(0.017, 0.015, 0.16, 8), handleMat);
+    handle.position.y = -0.08;
+    group.add(handle);
+    for (let i = 0; i < 6; i++) {
+      const wrapMat = new THREE.MeshStandardMaterial({ color: 0x0f1f3d, roughness: 0.9 });
+      const wrap = new THREE.Mesh(new THREE.TorusGeometry(0.018, 0.0035, 6, 10), wrapMat);
+      wrap.rotation.x = Math.PI / 2;
+      wrap.position.y = -0.015 - i * 0.025;
+      group.add(wrap);
+    }
+
+    // Small silver pommel cap with a blue gem tip
+    const pommelCap = new THREE.Mesh(new THREE.CylinderGeometry(0.024, 0.018, 0.02, 8), guardMat);
+    pommelCap.position.y = -0.165;
+    group.add(pommelCap);
+    const pommelGem = new THREE.Mesh(new THREE.OctahedronGeometry(0.016), gemMat);
+    pommelGem.position.y = -0.185;
+    group.add(pommelGem);
+
+    // start sword resting on a small pedestal near the player so it's easy to find
+    group.position.set(0.3, 0.9, -0.5);
+    group.rotation.z = -0.3;
+    worldGroup.add(group);
+
+    // Invisible marker near the blade tip - hit detection and swing
+    // speed should be measured from here, not the group's origin
+    // (which sits down at the handle and would require jabbing with
+    // the hilt to register a hit).
+    const tip = new THREE.Object3D();
+    tip.position.set(0, 0.62, 0);
+    group.add(tip);
+
+    registerWeapon(group, tip, {
+      minSpeed: 0.6, maxDamage: 45, grabRadius: 0.35, hitRadius: 0.28,
+      // Back holster: hilt up near the right shoulder, blade angled
+      // diagonally down across the back for an over-the-shoulder draw
+      holsterOffset: new THREE.Vector3(0.08, 0.3, -0.17),
+      holsterRotation: new THREE.Vector3(0, 0.3, Math.PI + 0.5)
+    });
+  }
+
+  function buildDagger(x, z) {
+    const group = new THREE.Group();
+
+    // Short black blade with a glowing blue edge - pairs visually
+    // with the sword's crimson glow (Elucidator/Dark Repulser vibe)
+    const bladeMat = new THREE.MeshStandardMaterial({ color: 0x15151a, metalness: 0.7, roughness: 0.3 });
+    const blade = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.22, 0.01), bladeMat);
+    blade.position.y = 0.13;
+    group.add(blade);
+
+    const edgeMat = new THREE.MeshBasicMaterial({ color: 0x44aaff });
+    const edge = new THREE.Mesh(new THREE.BoxGeometry(0.005, 0.21, 0.012), edgeMat);
+    edge.position.y = 0.13;
+    group.add(edge);
+
+    const glowLight = new THREE.PointLight(0x44aaff, 0.4, 0.8, 2);
+    glowLight.position.y = 0.2;
+    group.add(glowLight);
+
+    const guardMat = new THREE.MeshStandardMaterial({ color: 0x33333a, metalness: 0.7, roughness: 0.4 });
+    const guard = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.015, 0.02), guardMat);
+    group.add(guard);
+
+    const handleMat = new THREE.MeshStandardMaterial({ color: 0x1c1c1c, roughness: 0.95 });
+    const handle = new THREE.Mesh(new THREE.CylinderGeometry(0.013, 0.011, 0.09, 8), handleMat);
+    handle.position.y = -0.05;
+    group.add(handle);
+
+    const gemMat = new THREE.MeshBasicMaterial({ color: 0x44aaff });
+    const pommel = new THREE.Mesh(new THREE.OctahedronGeometry(0.014), gemMat);
+    pommel.position.y = -0.095;
+    group.add(pommel);
+
+    group.position.set(x, 0.85, z);
+    group.rotation.z = x > 0 ? -0.4 : 0.4;
+    worldGroup.add(group);
+
+    const tip = new THREE.Object3D();
+    tip.position.set(0, 0.24, 0);
+    group.add(tip);
+
+    // Hip position for its belt holster (local to playerTorso, set
+    // up once the body exists - see the wiring after buildPlayerBody)
+    const hipSide = x > 0 ? 0.18 : -0.18;
+    return registerWeapon(group, tip, {
+      minSpeed: 0.5, maxDamage: 22, grabRadius: 0.28, hitRadius: 0.22, throwable: true,
+      holsterOffset: new THREE.Vector3(hipSide, -0.2, -0.05),
+      holsterRotation: new THREE.Vector3(0, 0, hipSide > 0 ? -0.4 : 0.4),
+      throwPowerMultiplier: 2.8,
+      spinRate: 22
+    });
+  }
+
+  function buildBow() {
+    const group = new THREE.Group();
+
+    const limbMat = new THREE.MeshStandardMaterial({ color: 0x3a2a18, roughness: 0.8 });
+    // A partial torus makes a convincing curved bow limb - same trick
+    // used for the dungeon's doorway arches.
+    const limb = new THREE.Mesh(new THREE.TorusGeometry(0.38, 0.018, 6, 20, Math.PI * 0.92), limbMat);
+    limb.rotation.z = -Math.PI * 0.46; // orient the curve to open toward the player
+    group.add(limb);
+
+    // String anchor points, matched to the limb's actual endpoints
+    const topAnchor = new THREE.Vector3(0.02, 0.37, 0.06);
+    const bottomAnchor = new THREE.Vector3(-0.02, -0.37, 0.06);
+    const restNock = new THREE.Vector3(0, 0, 0.1);
+
+    const stringMat = new THREE.LineBasicMaterial({ color: 0xdddddd });
+    const stringGeom = new THREE.BufferGeometry().setFromPoints([topAnchor, restNock, bottomAnchor]);
+    const bowString = new THREE.Line(stringGeom, stringMat);
+    group.add(bowString);
+
+    group.position.set(0.3, 0.9, -0.5);
+    group.rotation.y = 0.4;
+    worldGroup.add(group);
+
+    const tip = new THREE.Object3D(); // just needs to exist for registerWeapon's bookkeeping
+    tip.position.copy(restNock);
+    group.add(tip);
+
+    const bowWeapon = registerWeapon(group, tip, {
+      minSpeed: 999, maxDamage: 0, grabRadius: 0.35, hitRadius: 0.01, throwable: false,
+      isBow: true,
+      // Back holster: left shoulder, mirroring the sword's right-shoulder mount
+      holsterOffset: new THREE.Vector3(-0.1, 0.28, -0.17),
+      holsterRotation: new THREE.Vector3(0, -0.3, -0.4)
+    });
+    bowWeapon.bowString = bowString;
+    bowWeapon.topAnchor = topAnchor;
+    bowWeapon.bottomAnchor = bottomAnchor;
+    bowWeapon.restNock = restNock;
+    bowWeapon.currentDraw = 0;
+    return bowWeapon;
+  }
+
+  function updateStringGeometry(bowWeapon, nockPos) {
+    const positions = bowWeapon.bowString.geometry.attributes.position;
+    positions.setXYZ(1, nockPos.x, nockPos.y, nockPos.z);
+    positions.needsUpdate = true;
+  }
+
+  function updateBowDraw() {
+    const bow = weapons.find(w => w.isBow);
+    if (!bow) return;
+
+    if (bow.heldBy && drawHand) {
+      const localHandPos = bow.group.worldToLocal(drawHand.getWorldPosition(new THREE.Vector3()));
+      const pull = localHandPos.clone().sub(bow.restNock);
+      const dist = Math.min(pull.length(), MAX_DRAW);
+      const nockPos = pull.lengthSq() > 0.0001
+        ? bow.restNock.clone().add(pull.normalize().multiplyScalar(dist))
+        : bow.restNock.clone();
+      updateStringGeometry(bow, nockPos);
+      bow.currentDraw = dist;
+    } else {
+      updateStringGeometry(bow, bow.restNock);
+      bow.currentDraw = 0;
+    }
+  }
+
+  function releaseArrow(controller) {
+    const bow = weapons.find(w => w.isBow);
+    if (!bow) return;
+
+    const draw = bow.currentDraw || 0;
+    updateStringGeometry(bow, bow.restNock);
+    bow.currentDraw = 0;
+    if (draw < 0.08) return; // too weak a draw to count as a shot
+
+    const bowWorld = bow.group.getWorldPosition(new THREE.Vector3());
+    const handWorld = controller.getWorldPosition(new THREE.Vector3());
+    const dir = bowWorld.clone().sub(handWorld).normalize();
+    const speed = THREE.MathUtils.clamp(draw * 22, 6, 18);
+
+    spawnArrow(bowWorld, dir, speed);
+  }
+
+  function spawnArrow(originWorld, dirWorld, speed) {
+    const group = new THREE.Group();
+
+    const shaftMat = new THREE.MeshStandardMaterial({ color: 0x5a4632, roughness: 0.8 });
+    const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.006, 0.5, 6), shaftMat);
+    shaft.position.y = 0.25;
+    group.add(shaft);
+
+    const tipMat = new THREE.MeshStandardMaterial({ color: 0x888888, metalness: 0.7, roughness: 0.3 });
+    const arrowTipMesh = new THREE.Mesh(new THREE.ConeGeometry(0.014, 0.05, 6), tipMat);
+    arrowTipMesh.position.y = 0.52;
+    group.add(arrowTipMesh);
+
+    const fletchMat = new THREE.MeshBasicMaterial({ color: 0xff3344, side: THREE.DoubleSide });
+    for (let i = 0; i < 3; i++) {
+      const f = new THREE.Mesh(new THREE.PlaneGeometry(0.02, 0.06), fletchMat);
+      f.position.y = 0.03;
+      f.rotation.y = i * (Math.PI * 2 / 3);
+      group.add(f);
+    }
+
+    worldGroup.add(group);
+    const localOrigin = worldGroup.worldToLocal(originWorld.clone());
+    group.position.copy(localOrigin);
+
+    const tip = new THREE.Object3D();
+    tip.position.set(0, 0.52, 0);
+    group.add(tip);
+
+    const arrow = registerWeapon(group, tip, {
+      minSpeed: 0.3, maxDamage: 30, grabRadius: 0.001, hitRadius: 0.15, throwable: false,
+      orientToVelocity: true
+    });
+    arrow.thrown = true;
+    arrow.throwVelocity.copy(dirWorld).multiplyScalar(speed);
+  }
+
+  function updateSkeletonAI(delta) {
+    if (!renderer.xr.isPresenting || playerDead || dummyDead) return;
+
+    const xrCamera = renderer.xr.getCamera(camera);
+    const playerPos = new THREE.Vector3();
+    xrCamera.getWorldPosition(playerPos);
+
+    const skeletonPos = dummy.getWorldPosition(new THREE.Vector3());
+    const eyePos = skeletonPos.clone();
+    eyePos.y += 1.4; // roughly head height, for the line-of-sight check
+
+    const toPlayer = playerPos.clone().sub(eyePos);
+    const distance = toPlayer.length();
+
+    let canSeePlayer = false;
+    if (distance < DETECTION_RANGE) {
+      raycaster.set(eyePos, toPlayer.clone().normalize());
+      raycaster.far = distance;
+      canSeePlayer = raycaster.intersectObjects(dungeonWalls, false).length === 0;
+    }
+
+    if (!canSeePlayer) {
+      skeletonState = 'idle';
+      skeletonAttackTimer = 0;
+      return;
+    }
+
+    skeletonState = distance <= ATTACK_RANGE ? 'attack' : 'chase';
+
+    // Face the player (skeleton's "front" is local +Z, so flip 180
+    // degrees after the standard lookAt, which faces -Z at target)
+    const lookTarget = playerPos.clone();
+    lookTarget.y = skeletonPos.y;
+    dummy.lookAt(lookTarget);
+    dummy.rotateY(Math.PI);
+
+    if (skeletonState === 'chase') {
+      const dir = toPlayer.clone();
+      dir.y = 0;
+      dir.normalize();
+      const moveAmount = Math.min(CHASE_SPEED * delta, distance - ATTACK_RANGE);
+      if (moveAmount > 0) {
+        const newWorldPos = skeletonPos.clone().addScaledVector(dir, moveAmount);
+        worldGroup.worldToLocal(newWorldPos);
+        dummy.position.x = newWorldPos.x;
+        dummy.position.z = newWorldPos.z;
+      }
+    } else if (skeletonState === 'attack') {
+      skeletonAttackTimer += delta;
+      if (skeletonAttackTimer >= ATTACK_INTERVAL) {
+        skeletonAttackTimer = 0;
+        damagePlayer(ATTACK_DAMAGE);
+      }
+    }
+  }
+
+  function damagePlayer(amount, flashColor) {
+    if (playerDead) return;
+    playerHealth = Math.max(0, playerHealth - amount);
+    updatePlayerHealthUI();
+    damageFlashMesh.material.color.set(flashColor || 0xff0000);
+    damageFlashMesh.material.opacity = 0.5;
+
+    if (playerHealth <= 0) {
+      playerDead = true;
+      damageFlashMesh.material.color.set(0x330000);
+      damageFlashMesh.material.opacity = 0.85;
+      setTimeout(respawnPlayer, 3000);
+    }
+  }
+
+  function updatePlayerHealthUI() {
+    const pct = playerHealth / 100;
+    playerHealthBarFill.scale.x = Math.max(0.001, pct);
+    playerHealthBarFill.position.x = -0.1 * (1 - pct);
+    playerHealthBarFill.material.color.setHSL(pct / 3, 0.8, 0.5);
+  }
+
+  function updateXPUI() {
+    const pct = playerXP / xpToNextLevel;
+    xpBarFill.scale.x = Math.max(0.001, pct);
+    xpBarFill.position.x = -0.1 * (1 - pct);
+  }
+
+  function updateLevelDisplay() {
+    if (!levelCtx) return;
+    const ctx = levelCtx;
+    ctx.clearRect(0, 0, levelCanvas.width, levelCanvas.height);
+    ctx.fillStyle = '#e8edf5';
+    ctx.font = 'bold 26px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText('LV ' + playerLevel, 4, 28);
+    levelTexture.needsUpdate = true;
+  }
+
+  function awardXP(amount) {
+    playerXP += amount;
+    while (playerXP >= xpToNextLevel) {
+      playerXP -= xpToNextLevel;
+      playerLevel += 1;
+      xpToNextLevel = Math.round(xpToNextLevel * 1.25); // each level takes a bit more
+      updateLevelDisplay();
+    }
+    updateXPUI();
+  }
+
+  function respawnPlayer() {
+    playerHealth = 100;
+    playerDead = false;
+    updatePlayerHealthUI();
+    damageFlashMesh.material.color.set(0xff0000);
+    damageFlashMesh.material.opacity = 0;
+
+    // Reset the player back to the spawn room
+    worldGroup.position.set(0, 0, 0);
+    worldGroup.quaternion.identity();
+    playerVerticalVelocity = 0;
+    playerJumpOffset = 0;
+
+    // Reset the skeleton too, in case it's mid-chase or dead
+    dummyHealth = 100;
+    dummyDead = false;
+    skeletonState = 'idle';
+    skeletonAttackTimer = 0;
+    dummy.position.set(0, 0, -31.5);
+    dummy.rotation.set(0, 0, 0);
+    hpText.textContent = 100;
+    dummyHealthBarFill.scale.x = 1;
+    dummyHealthBarFill.position.x = 0;
+    dummyHealthBarFill.material.color.set(0x4ade80);
+
+    // Clear poison and any darts still in flight
+    poisonTimer = 0;
+    poisonTickAccum = 0;
+    activeDarts.forEach(d => scene.remove(d.mesh));
+    activeDarts.length = 0;
+
+    // Force the gas trap room back to a clean, unlocked state
+    gasRoomState = 'idle';
+    gasRoomTimer = 0;
+    gasDoorTargetY = GAS_DOOR_OPEN_Y;
+    gasOpacityTarget = 0;
+    if (gasDoorCollisionBox) {
+      const idx = collisionWalls.indexOf(gasDoorCollisionBox);
+      if (idx !== -1) collisionWalls.splice(idx, 1);
+      gasDoorCollisionBox = null;
+    }
+  }
+
+  function buildInventoryPanel() {
+    inventoryCanvas = document.createElement('canvas');
+    inventoryCanvas.width = 256;
+    inventoryCanvas.height = 192;
+    inventoryCtx = inventoryCanvas.getContext('2d');
+
+    inventoryTexture = new THREE.CanvasTexture(inventoryCanvas);
+    const panelMat = new THREE.MeshBasicMaterial({ map: inventoryTexture, transparent: true });
+    inventoryPanel = new THREE.Mesh(new THREE.PlaneGeometry(0.11, 0.0825), panelMat);
+
+    // Mounted on the left controller like a watch face - tilt it so
+    // it reads naturally when you rotate your wrist up to look at it.
+    inventoryPanel.position.set(0, 0.02, -0.04);
+    inventoryPanel.rotation.set(-Math.PI / 2.3, 0, 0);
+    controller1.add(inventoryPanel);
+
+    updateInventoryDisplay();
+  }
+
+  function getWeaponStatus(w) {
+    if (w.isBow && w.heldBy && drawHand) return 'Drawing';
+    if (w.heldBy) return 'In Hand';
+    if (w.thrown) return 'In Flight';
+    if (w.holsterOffset && w.group.parent === playerTorso) return 'Holstered';
+    return 'On Ground';
+  }
+
+  function updateInventoryDisplay() {
+    if (!inventoryCtx) return;
+    const ctx = inventoryCtx;
+    const w = inventoryCanvas.width, h = inventoryCanvas.height;
+
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = 'rgba(15,15,20,0.85)';
+    ctx.fillRect(0, 0, w, h);
+    ctx.strokeStyle = '#6ee7ff';
+    ctx.lineWidth = 4;
+    ctx.strokeRect(2, 2, w - 4, h - 4);
+
+    ctx.fillStyle = '#6ee7ff';
+    ctx.font = 'bold 22px sans-serif';
+    ctx.fillText('INVENTORY', 14, 30);
+
+    const rows = [
+      { label: 'Sword', w: weapons[0] },
+      { label: 'Dagger L', w: weapons[1] },
+      { label: 'Dagger R', w: weapons[2] },
+      { label: 'Bow', w: weapons.find(w => w.isBow) }
+    ];
+
+    ctx.font = '18px sans-serif';
+    rows.forEach((row, i) => {
+      if (!row.w) return;
+      const y = 58 + i * 34;
+      const status = getWeaponStatus(row.w);
+
+      ctx.fillStyle = '#e8edf5';
+      ctx.fillText(row.label, 14, y);
+
+      ctx.fillStyle = status === 'In Hand' ? '#4ade80'
+        : status === 'Drawing' ? '#ffcc55'
+        : status === 'Holstered' ? '#aab' : status === 'In Flight' ? '#ffcc55' : '#ff6666';
+      ctx.fillText(status, 130, y);
+    });
+
+    inventoryTexture.needsUpdate = true;
+  }
+
+  function onGrabStart(controller) {
+    // already holding something in this hand
+    if (weapons.some(w => w.heldBy === controller)) return;
+    if (drawHand === controller) return;
+
+    // If the other hand holds the bow, this press means "nock and draw"
+    const otherController = controller === controller1 ? controller2 : controller1;
+    const bow = weapons.find(w => w.isBow);
+    if (bow && bow.heldBy === otherController && drawHand === null) {
+      drawHand = controller;
+      updateInventoryDisplay();
+      return;
+    }
+
+    const controllerPos = controller.getWorldPosition(new THREE.Vector3());
+    let nearest = null;
+    let nearestDist = Infinity;
+    weapons.forEach(w => {
+      if (w.heldBy) return; // already held by the other hand
+      const d = controllerPos.distanceTo(w.group.getWorldPosition(new THREE.Vector3()));
+      if (d < w.grabRadius && d < nearestDist) {
+        nearest = w;
+        nearestDist = d;
+      }
+    });
+
+    if (nearest) {
+      nearest.heldBy = controller;
+      nearest.thrown = false; // catches a mid-flight throw too
+      nearest.throwVelocity.set(0, 0, 0);
+      controller.add(nearest.group);
+      nearest.group.position.set(0, 0, -0.05);
+      nearest.group.rotation.set(0, 0, 0);
+      updateInventoryDisplay();
+    }
+  }
+
+  function onGrabEnd(controller) {
+    if (drawHand === controller) {
+      releaseArrow(controller);
+      drawHand = null;
+      updateInventoryDisplay();
+      return;
+    }
+
+    const w = weapons.find(w => w.heldBy === controller);
+    if (!w) return;
+
+    w.heldBy = null;
+
+    // Letting go of the bow while mid-draw cancels the shot
+    if (w.isBow && drawHand) {
+      drawHand = null;
+      updateStringGeometry(w, w.restNock);
+      w.currentDraw = 0;
+    }
+
+    let didThrow = false;
+    if (w.throwable) {
+      const vel = controller.userData.velocity || new THREE.Vector3();
+      if (vel.length() > 1.0) { // only counts as a real throw, not a gentle drop
+        didThrow = true;
+        w.thrown = true;
+        w.throwVelocity.copy(vel).multiplyScalar(w.throwPowerMultiplier);
+      }
+    }
+
+    if (!didThrow && w.holsterOffset && playerTorso) {
+      // Snap back onto its holster rather than dropping in place
+      playerTorso.attach(w.group);
+      w.group.position.copy(w.holsterOffset);
+      w.group.rotation.set(w.holsterRotation.x, w.holsterRotation.y, w.holsterRotation.z);
+    } else {
+      worldGroup.attach(w.group); // preserves world position/rotation while reparenting
+    }
+    updateInventoryDisplay();
+  }
+
+  function updateControllerVelocities(delta) {
+    [controller1, controller2].forEach(c => {
+      const cur = c.getWorldPosition(new THREE.Vector3());
+      if (!c.userData.prevPos) c.userData.prevPos = cur.clone();
+      c.userData.velocity = cur.clone().sub(c.userData.prevPos).divideScalar(Math.max(delta, 0.0001));
+      c.userData.prevPos.copy(cur);
+    });
+  }
+
+  function updateThrownWeapons(delta) {
+    weapons.forEach(w => {
+      if (!w.thrown) return;
+
+      w.throwVelocity.y -= 9.8 * delta; // gravity
+      const curWorld = w.group.getWorldPosition(new THREE.Vector3());
+      const newWorld = curWorld.clone().addScaledVector(w.throwVelocity, delta);
+
+      if (newWorld.y <= 0.05) {
+        newWorld.y = 0.05;
+        w.thrown = false;
+        w.throwVelocity.set(0, 0, 0);
+      } else if (w.orientToVelocity) {
+        const dir = w.throwVelocity.clone().normalize();
+        if (dir.lengthSq() > 0.0001) {
+          const desiredWorldQuat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+          const parentWorldQuat = worldGroup.getWorldQuaternion(new THREE.Quaternion());
+          w.group.quaternion.copy(parentWorldQuat.invert().multiply(desiredWorldQuat));
+        }
+      } else {
+        w.group.rotation.x += delta * w.spinRate; // tumble while flying
+      }
+
+      worldGroup.worldToLocal(newWorld);
+      w.group.position.copy(newWorld);
+    });
+  }
+
+  function handleJump(delta) {
+    const session = renderer.xr.getSession();
+    if (!session) return;
+
+    let jumpPressed = false;
+    for (const source of session.inputSources) {
+      if (source.handedness === 'right' && source.gamepad) {
+        const buttons = source.gamepad.buttons;
+        // On Quest Touch controllers, button index 4 is the "A" button
+        if (buttons.length > 4 && buttons[4].pressed) jumpPressed = true;
+      }
+    }
+
+    // Only jump on a fresh press, and only while grounded
+    if (jumpPressed && !jumpButtonWasPressed && playerJumpOffset <= 0.001) {
+      playerVerticalVelocity = JUMP_SPEED;
+    }
+    jumpButtonWasPressed = jumpPressed;
+
+    if (playerJumpOffset > 0 || playerVerticalVelocity > 0) {
+      playerVerticalVelocity -= GRAVITY * delta;
+      playerJumpOffset += playerVerticalVelocity * delta;
+      if (playerJumpOffset <= 0) {
+        playerJumpOffset = 0;
+        playerVerticalVelocity = 0;
+      }
+    }
+
+    // The world moves opposite the player's intended motion (same
+    // trick used for walking) - moving it down makes the player
+    // appear to rise.
+    worldGroup.position.y = -playerJumpOffset;
+  }
+
+  function circleIntersectsBox(cx, cz, r, box) {
+    const closestX = THREE.MathUtils.clamp(cx, box.minX, box.maxX);
+    const closestZ = THREE.MathUtils.clamp(cz, box.minZ, box.maxZ);
+    const dx = cx - closestX;
+    const dz = cz - closestZ;
+    return (dx * dx + dz * dz) < r * r;
+  }
+
+  function collidesAt(x, z) {
+    const playerRadius = 0.3;
+
+    for (const box of collisionWalls) {
+      if (circleIntersectsBox(x, z, playerRadius, box)) return true;
+    }
+    for (const p of collisionProps) {
+      const dx = x - p.x, dz = z - p.z;
+      const minDist = playerRadius + p.radius;
+      if (dx * dx + dz * dz < minDist * minDist) return true;
+    }
+    if (dummy && !dummyDead) {
+      const dx = x - dummy.position.x, dz = z - dummy.position.z;
+      const minDist = playerRadius + 0.4; // skeleton's rough collision radius
+      if (dx * dx + dz * dz < minDist * minDist) return true;
+    }
+    return false;
+  }
+
+  // Moves the world by worldMoveVec (world space, as computed by
+  // handleLocomotion) but blocks/slides the movement if it would put
+  // the player inside a wall, prop, or the skeleton. All the actual
+  // collision testing happens in dungeon-local space (the same space
+  // the walls/props were placed in), then the final allowed delta is
+  // converted back to a world-space move on worldGroup.
+  function applyCollisionAwareMove(worldMoveVec, headWorldPos) {
+    worldGroup.updateMatrixWorld(true);
+
+    const invQuat = worldGroup.quaternion.clone().invert();
+    const localMoveVec = worldMoveVec.clone().applyQuaternion(invQuat);
+
+    const currentLocalPos = worldGroup.worldToLocal(headWorldPos.clone());
+
+    const fullX = currentLocalPos.x + localMoveVec.x;
+    const fullZ = currentLocalPos.z + localMoveVec.z;
+
+    let finalDx = 0;
+    let finalDz = 0;
+
+    if (!collidesAt(fullX, fullZ)) {
+      finalDx = localMoveVec.x;
+      finalDz = localMoveVec.z;
+    } else {
+      // Slide along whichever single axis is still clear
+      if (!collidesAt(currentLocalPos.x + localMoveVec.x, currentLocalPos.z)) {
+        finalDx = localMoveVec.x;
+      }
+      if (!collidesAt(currentLocalPos.x, currentLocalPos.z + localMoveVec.z)) {
+        finalDz = localMoveVec.z;
+      }
+    }
+
+    if (finalDx !== 0 || finalDz !== 0) {
+      const worldSpaceEquivalent = new THREE.Vector3(finalDx, 0, finalDz).applyQuaternion(worldGroup.quaternion);
+      worldGroup.position.sub(worldSpaceEquivalent);
+    }
+  }
+
+  function handleLocomotion(delta) {
+    const session = renderer.xr.getSession();
+    if (!session) return;
+
+    const xrCamera = renderer.xr.getCamera(camera);
+    const forward = new THREE.Vector3();
+    xrCamera.getWorldDirection(forward);
+    forward.y = 0;
+    forward.normalize();
+    const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 1, 0)).normalize();
+
+    const speed = 2.2; // meters/second
+    let turnInput = 0;
+
+    for (const source of session.inputSources) {
+      if (!source.gamepad) continue;
+      const axes = source.gamepad.axes;
+      // Quest touch controllers report thumbstick on axes[2]/axes[3]
+      let x = 0, y = 0;
+      if (axes.length >= 4) { x = axes[2]; y = axes[3]; }
+      else if (axes.length >= 2) { x = axes[0]; y = axes[1]; }
+
+      if (source.handedness === 'right') {
+        turnInput = x; // used for snap-turn below
+      } else {
+        // left controller (or unknown) = walking
+        if (Math.abs(x) > 0.15 || Math.abs(y) > 0.15) {
+          const moveForward = -y;
+          const moveRight = x;
+          const worldMoveVec = new THREE.Vector3(
+            forward.x * moveForward + right.x * moveRight,
+            0,
+            forward.z * moveForward + right.z * moveRight
+          ).multiplyScalar(speed * delta);
+
+          applyCollisionAwareMove(worldMoveVec, xrCamera.position);
+        }
+      }
+    }
+
+    // Snap-turn: push right thumbstick left/right to rotate 45 degrees
+    if (Math.abs(turnInput) > 0.6 && !snapTurnCooldown) {
+      const angle = turnInput > 0 ? -Math.PI / 4 : Math.PI / 4;
+      rotateWorldAroundPoint(angle, xrCamera.position);
+      snapTurnCooldown = true;
+    } else if (Math.abs(turnInput) < 0.3) {
+      snapTurnCooldown = false;
+    }
+  }
+
+  function rotateWorldAroundPoint(angle, pivotWorldPos) {
+    const qDelta = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), angle);
+    const offset = worldGroup.position.clone().sub(pivotWorldPos);
+    offset.applyQuaternion(qDelta);
+    worldGroup.position.copy(pivotWorldPos).add(offset);
+    worldGroup.quaternion.premultiply(qDelta);
+  }
+
+  function checkSupport() {
+    if (navigator.xr && navigator.xr.isSessionSupported) {
+      navigator.xr.isSessionSupported('immersive-vr').then(supported => {
+        if (supported) {
+          enterBtn.textContent = 'Enter VR';
+          enterBtn.disabled = false;
+        } else {
+          enterBtn.textContent = 'VR not available';
+          enterBtn.disabled = true;
+          statusEl.textContent = 'Open this page in your Quest browser to play in VR.';
+        }
+      });
+    } else {
+      enterBtn.textContent = 'VR not supported here';
+      enterBtn.disabled = true;
+      statusEl.textContent = 'Open this page in your Quest browser to play in VR.';
+    }
+  }
+
+  function enterVR() {
+    renderer.xr.setReferenceSpaceType('local-floor');
+    navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor'] })
+      .then(session => {
+        renderer.xr.setSession(session);
+        overlay.style.display = 'none';
+        hud.style.display = 'block';
+        session.addEventListener('end', () => {
+          overlay.style.display = 'flex';
+          hud.style.display = 'none';
+        });
+      })
+      .catch(err => {
+        statusEl.textContent = 'Could not start VR session: ' + err.message;
+      });
+  }
+
+  function onResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  }
+
+  function updateWeaponPhysics() {
+    weapons.forEach(w => {
+      const currentPos = w.tip.getWorldPosition(new THREE.Vector3());
+      w.velocity.subVectors(currentPos, w.prevPos);
+      w.prevPos.copy(currentPos);
+    });
+  }
+
+  function checkWeaponHits() {
+    if (dummyDead) return;
+    const now = performance.now();
+
+    weapons.forEach(w => {
+      if (!w.heldBy && !w.thrown) return;
+
+      const speed = w.velocity.length() / (1 / 72); // approx m/s at ~72fps
+      if (speed < w.minSpeed) return;
+      if (now - w.lastHitTime < 250) return; // cooldown
+
+      const weaponPos = w.tip.getWorldPosition(new THREE.Vector3());
+      const dHeadPos = dummyHead.getWorldPosition(new THREE.Vector3());
+      const dBodyPos = dummyBody.getWorldPosition(new THREE.Vector3());
+
+      const distHead = weaponPos.distanceTo(dHeadPos);
+      const distBody = weaponPos.distanceTo(dBodyPos);
+
+      if (distHead < w.hitRadius || distBody < w.hitRadius + 0.07) {
+        w.lastHitTime = now;
+        const dmg = THREE.MathUtils.clamp(speed * 6, w.maxDamage * 0.2, w.maxDamage);
+        applyDamageToDummy(dmg);
+        if (w.thrown) {
+          w.thrown = false; // drops where it hit instead of flying through
+          w.throwVelocity.set(0, 0, 0);
+        }
+      }
+    });
+  }
+
+  function applyDamageToDummy(dmg) {
+    dummyHealth = Math.max(0, dummyHealth - dmg);
+    hpText.textContent = Math.round(dummyHealth);
+    dummyHealthBarFill.scale.x = Math.max(0.001, dummyHealth / 100);
+    dummyHealthBarFill.position.x = -0.24 * (1 - dummyHealth / 100);
+    dummyHealthBarFill.material.color.setHSL(dummyHealth / 300, 0.8, 0.5);
+
+    // knockback / hit reaction
+    dummy.position.x += (Math.random() - 0.5) * 0.05;
+    dummyBody.rotation.z = (Math.random() - 0.5) * 0.3;
+
+    awardXP(Math.round(dmg)); // XP per point of damage landed
+
+    if (dummyHealth <= 0) {
+      dummyDead = true;
+      awardXP(50); // kill bonus
+      fallOver();
+    }
+  }
+
+  function fallOver() {
+    let t = 0;
+    const fall = () => {
+      t += 0.02;
+      dummy.rotation.x = Math.min(Math.PI / 2, t);
+      dummy.position.y = Math.max(0, dummy.position.y - 0.01);
+      if (t < Math.PI / 2) requestAnimationFrame(fall);
+      else {
+        setTimeout(resetDummy, 1800);
+      }
+    };
+    fall();
+  }
+
+  function resetDummy() {
+    dummy.rotation.x = 0;
+    dummy.position.y = 0;
+    dummyHealth = 100;
+    dummyDead = false;
+    skeletonState = 'idle';
+    skeletonAttackTimer = 0;
+    hpText.textContent = 100;
+    dummyHealthBarFill.scale.x = 1;
+    dummyHealthBarFill.position.x = 0;
+    dummyHealthBarFill.material.color.set(0x4ade80);
+  }
+
+  function render() {
+    const delta = clock.getDelta();
+    handleLocomotion(delta);
+    handleJump(delta);
+    updateControllerVelocities(delta);
+    updateThrownWeapons(delta);
+    updateWeaponPhysics();
+    checkWeaponHits();
+    updateBowDraw();
+    updateSkeletonAI(delta);
+    updatePlayerBody();
+    updateMirrorAvatar();
+    updateTrapTile(delta);
+    updateDarts(delta);
+    updatePoison(delta);
+    updateGasRoom(delta);
+
+    inventoryUpdateTimer += delta;
+    if (inventoryUpdateTimer > 0.5) {
+      inventoryUpdateTimer = 0;
+      updateInventoryDisplay();
+    }
+
+    if (!playerDead && damageFlashMesh.material.opacity > 0) {
+      damageFlashMesh.material.opacity = Math.max(0, damageFlashMesh.material.opacity - delta * 0.8);
+    }
+
+    renderer.render(scene, camera);
+  }
+})();
+</script>
+</body>
+</html>
